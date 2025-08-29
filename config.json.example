@@ -1,0 +1,11 @@
+{
+    "test_email_recipient": "your-test-email@gmail.com",
+    "telegram_bot_token": "YOUR_BOT_TOKEN_HERE",
+    "telegram_chat_id": "YOUR_CHAT_ID_HERE",
+    "max_threads": 8,
+    "delay_range": [
+        1,
+        5
+    ],
+    "smtp_timeout": 10
+}
