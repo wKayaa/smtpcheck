@@ -1,0 +1,18 @@
+# Sample SMTP combos for testing
+# Format: email:password (also supports ; and | separators)
+# Lines starting with # are comments
+
+# Valid format examples:
+test1@outlook.com:password123
+test2@hotmail.com:mypassword
+invalid-email:wrongformat
+user@office365.com;anotherpassword
+testuser@live.com|testpass123
+
+# Invalid format examples (will be skipped):
+# invalid-line-without-separator
+# @invalid.email:password
+# valid@email.com:
+
+# The checker will process each valid line and test the credentials
+# Results will be saved to valid.txt and invalid.txt
